@@ -1012,3 +1012,48 @@ fn a_push_from_a_shallow_clone_is_judged_on_what_it_brings() {
         "{answer}"
     );
 }
+
+/// A refusal's reason is one line of the report, whatever it holds, and the report is inside side band 1 when the client
+/// asked for side bands, as git asks.
+#[test]
+fn a_refusal_is_reported_on_one_line_inside_the_side_band() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    let repo = gix::open(&d.server).unwrap();
+    for (capabilities, banded) in [("report-status", false), ("report-status side-band-64k", true)] {
+        let mut body = pkt(&format!("{} {} refs/heads/main\0{capabilities}\n", d.second, d.first));
+        body.extend(b"0000");
+        let mut out = Vec::new();
+        let interrupt = AtomicBool::new(false);
+        let mut pack = pack_of(&d.work, &home, &["--revs"], &format!("{}\n", d.first));
+        body.append(&mut pack);
+        gix_serve::receive_pack::serve(&repo, &body, &mut out, &interrupt, |_, _| Err("one\ntwo".into())).unwrap();
+        let report = if banded {
+            let lines = packets(&out);
+            assert_eq!(lines.last(), Some(&None), "a flush ends the band");
+            let inner: Vec<u8> = lines
+                .into_iter()
+                .flatten()
+                .map(|line| {
+                    assert_eq!(line[0], 1, "side band 1");
+                    line[1..].to_vec()
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            inner
+        } else {
+            out
+        };
+        let lines = packets(&report);
+        assert_eq!(
+            lines,
+            vec![
+                Some(b"unpack ok\n".to_vec()),
+                Some(b"ng refs/heads/main one two\n".to_vec()),
+                None
+            ],
+            "{capabilities}"
+        );
+    }
+}
