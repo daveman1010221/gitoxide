@@ -969,3 +969,46 @@ fn an_interrupted_request_stops() {
     let mut out = Vec::new();
     assert!(gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out, &interrupt).is_err());
 }
+
+/// A push from a shallow clone names where its history is cut before its commands. Those lines are passed over and the push
+/// is judged on what it brings: taken when the repository has the rest, refused as missing objects when it does not.
+#[test]
+fn a_push_from_a_shallow_clone_is_judged_on_what_it_brings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    let null = "0".repeat(40);
+    let push = |commands: &[String], pack: &[u8]| {
+        let repo = gix::open(&d.server).unwrap();
+        let mut body = pkt(&format!("shallow {}\n", d.first));
+        for (i, command) in commands.iter().enumerate() {
+            body.extend(pkt(&if i == 0 {
+                format!("{command}\0report-status\n")
+            } else {
+                format!("{command}\n")
+            }));
+        }
+        body.extend(b"0000");
+        body.extend(pack);
+        let mut out = Vec::new();
+        gix_serve::receive_pack::serve(&repo, &body, &mut out, &AtomicBool::new(false), |_, _| Ok(())).unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let other = pack_of(&d.work, &home, &["--revs"], &format!("{}\n^{}\n", d.other, d.first));
+    let answer = push(&[format!("{null} {} refs/heads/side", d.other)], &other);
+    assert!(answer.contains("ok refs/heads/side"), "{answer}");
+
+    // `third` on `other`, sent without `other`, to a repository without it.
+    ok(&d.server, &home, &["update-ref", "-d", "refs/heads/side"]);
+    ok(&d.server, &home, &["reflog", "expire", "--expire=now", "--all"]);
+    ok(&d.server, &home, &["gc", "--quiet", "--prune=now"]);
+    write(&d.work, "README", "hello a fourth way\n");
+    ok(&d.work, &home, &["commit", "--quiet", "-am", "third"]);
+    let third = ok(&d.work, &home, &["rev-parse", "HEAD"]);
+    let cut = pack_of(&d.work, &home, &["--revs"], &format!("{third}\n^{}\n", d.other));
+    let answer = push(&[format!("{null} {third} refs/heads/side")], &cut);
+    assert!(
+        answer.contains("ng refs/heads/side missing necessary objects"),
+        "{answer}"
+    );
+}

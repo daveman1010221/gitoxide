@@ -442,13 +442,10 @@ fn pack(
     }
 
     let progress = gix::progress::Discard;
-    // A handle the pack's entries can be made with on other threads.
-    let mut db = gix::open(repo.path())
-        .map_err(|e| Error::new(format!("the repository cannot be opened for the pack: {e}")))?
-        .into_sync()
-        .objects
-        .into_shared_arc()
-        .to_cache_arc();
+    // A handle the pack's entries can be made with on other threads: the repository's objects, read as they are on disk.
+    let mut db = gix::odb::at(repo.objects.store_ref().path(), repo.object_hash())
+        .and_then(gix::odb::Handle::into_arc)
+        .map_err(|e| Error::new(format!("the objects cannot be opened for the pack: {e}")))?;
     // As `gix pack create` does: a pack's entries are copied from the packs they are in, which must stay put meanwhile.
     db.prevent_pack_unload();
     db.ignore_replacements = true;

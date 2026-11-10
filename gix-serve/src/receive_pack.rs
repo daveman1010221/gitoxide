@@ -66,6 +66,11 @@ fn parse(body: &[u8]) -> Result<Request> {
     let mut side_band = false;
     for line in lines {
         let Line::Data(data) = line else { break };
+        // A client pushing from a shallow clone names where its history is cut. Nothing is done with them: what the push
+        // lacks below those commits is missing, and the push is refused for it, as git refuses one by default.
+        if data.starts_with(b"shallow ") {
+            continue;
+        }
         let (command, capabilities) = data.split_once_str(b"\0").unwrap_or((data, b""));
         if commands.is_empty() {
             side_band = capabilities.split_str(" ").any(|c| c == b"side-band-64k");
@@ -120,11 +125,9 @@ pub fn serve(
                         allow(&quarantined, &commands)
                     })
                     .and_then(|()| quarantine.publish(repo))
-                    .and_then(|()| {
-                        // The pack is among the repository's now: read it again, so its objects are found.
-                        gix::open(repo.path()).map_err(|e| format!("the repository cannot be opened again: {e}"))
-                    })
-                    .and_then(|repo| update(&repo, &commands));
+                    // The repository's object store looks for packs it has not seen when an object is not found, so the
+                    // pack just moved in is read through it.
+                    .and_then(|()| update(repo, &commands));
                 (Ok(()), outcome)
             }
         }
