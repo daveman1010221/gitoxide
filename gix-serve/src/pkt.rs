@@ -23,6 +23,12 @@ pub(crate) fn flush(out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// The delimiter between a version 2 request's capabilities and its arguments, or between a response's sections.
+pub(crate) fn delimiter(out: &mut impl Write) -> Result<()> {
+    encode::delim_to_write(&mut *out)?;
+    Ok(())
+}
+
 /// `bytes` on `channel`, split into packets each band can carry.
 pub(crate) fn band(channel: Channel, bytes: &[u8], out: &mut impl Write) -> Result<()> {
     for chunk in bytes.chunks(BAND_DATA_MAX) {
@@ -36,6 +42,8 @@ pub(crate) enum Line<'a> {
     /// A data line, its trailing newline taken off.
     Data(&'a [u8]),
     Flush,
+    /// Version 2's delimiter.
+    Delimiter,
 }
 
 /// Reads packet lines from `body` until it is used up, or until `stop` says so of a line, returning the lines and how many
@@ -53,9 +61,8 @@ pub(crate) fn lines<'a>(body: &'a [u8], mut stop: impl FnMut(&Line<'a>) -> bool)
         let line = match line {
             PacketLineRef::Data(d) => Line::Data(d.strip_suffix(b"\n").unwrap_or(d)),
             PacketLineRef::Flush => Line::Flush,
-            PacketLineRef::Delimiter | PacketLineRef::ResponseEnd => {
-                return Err(Error::new("a delimiter in a version 0 request"));
-            }
+            PacketLineRef::Delimiter => Line::Delimiter,
+            PacketLineRef::ResponseEnd => return Err(Error::new("a response end in a request")),
         };
         let done = stop(&line);
         lines.push(line);

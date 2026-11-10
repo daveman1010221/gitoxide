@@ -26,6 +26,7 @@ fn one(root: &Path, reader: &mut BufReader<TcpStream>, stream: &TcpStream) -> st
     let mut length = None;
     let mut chunked = false;
     let mut gzip = false;
+    let mut protocol = None;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header)?;
@@ -38,6 +39,7 @@ fn one(root: &Path, reader: &mut BufReader<TcpStream>, stream: &TcpStream) -> st
             "content-length" => length = value.trim().parse::<usize>().ok(),
             "transfer-encoding" => chunked = value.trim().eq_ignore_ascii_case("chunked"),
             "content-encoding" => gzip = value.trim().eq_ignore_ascii_case("gzip"),
+            "git-protocol" => protocol = Some(value.trim().to_string()),
             _ => {}
         }
     }
@@ -109,12 +111,13 @@ fn one(root: &Path, reader: &mut BufReader<TcpStream>, stream: &TcpStream) -> st
             return Ok(true);
         }
     };
+    let protocol = gix_serve::Protocol::from_header(protocol.as_deref());
     let mut out = Vec::new();
     let served = match (method.as_str(), advertisement, service) {
-        ("GET", true, service) => {
-            gix_serve::service_header(service, &mut out).and_then(|()| gix_serve::advertise(&repo, service, &mut out))
+        ("GET", true, service) => gix_serve::advertise(&repo, service, protocol, &mut out),
+        ("POST", false, gix_serve::Service::UploadPack) => {
+            gix_serve::upload_pack::serve(&repo, protocol, &body, &mut out)
         }
-        ("POST", false, gix_serve::Service::UploadPack) => gix_serve::upload_pack::serve(&repo, &body, &mut out),
         ("POST", false, gix_serve::Service::ReceivePack) => {
             gix_serve::receive_pack::serve(&repo, &body, &mut out, |_, _| Ok(()))
         }
