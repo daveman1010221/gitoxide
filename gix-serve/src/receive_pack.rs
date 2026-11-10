@@ -277,7 +277,10 @@ fn complete(
 }
 
 /// A pushed pack's place until the push is allowed: `objects/incoming-<pid>-<n>`, with the repository's objects as its
-/// alternate, as git's own `tmp_objdir`. It is removed when dropped, whatever happened.
+/// alternate, as git's own `tmp_objdir`. It is removed when dropped, whatever happened. It is always a directory made for
+/// this push: one left by a process that ended without removing its own (a crash), under a name that may come again (a
+/// server that is PID 1 in its container, its count starting again), is passed over, never used, so what it holds, never
+/// judged, cannot be published with this push.
 struct Quarantine {
     directory: PathBuf,
 }
@@ -287,14 +290,20 @@ impl Quarantine {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let objects = repo.objects.store_ref().path().to_owned();
         let objects = objects.canonicalize().unwrap_or(objects);
-        let directory = objects.join(format!(
-            "incoming-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let quarantine = Quarantine { directory };
-        std::fs::create_dir_all(quarantine.pack_directory())?;
-        std::fs::create_dir_all(quarantine.directory.join("info"))?;
+        let quarantine = loop {
+            let directory = objects.join(format!(
+                "incoming-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => break Quarantine { directory },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        std::fs::create_dir(quarantine.pack_directory())?;
+        std::fs::create_dir(quarantine.directory.join("info"))?;
         let alternate = objects
             .to_str()
             .ok_or_else(|| Error::new("the objects directory's path is not UTF-8"))?;

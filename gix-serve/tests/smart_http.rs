@@ -1057,3 +1057,44 @@ fn a_refusal_is_reported_on_one_line_inside_the_side_band() {
         );
     }
 }
+
+/// A quarantine a crashed process left, under a name this one may use (a server that is PID 1 in its container starts its
+/// count again), is never used: what it holds was never judged, and is not published with the next push.
+#[test]
+fn a_quarantine_left_by_a_crash_is_never_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    let objects = d.server.join("objects");
+    let objects = objects.canonicalize().unwrap();
+    for n in 0..1000 {
+        let left = objects
+            .join(format!("incoming-{}-{n}", std::process::id()))
+            .join("pack");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("pack-left.pack"), b"never judged").unwrap();
+        std::fs::write(left.join("pack-left.idx"), b"never judged").unwrap();
+    }
+    let pack = pack_of(
+        &d.work,
+        &home,
+        &["--revs", "--thin"],
+        &format!("{}\n^{}\n", d.other, d.first),
+    );
+    let (answer, applied) = receive(
+        &d.server,
+        &[format!("{} {} refs/heads/side", "0".repeat(40), d.other)],
+        &pack,
+    );
+    assert!(answer.contains("ok refs/heads/side"), "{answer}");
+    assert_eq!(applied.len(), 1);
+    assert!(
+        !std::fs::read_dir(objects.join("pack")).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pack-left")),
+        "what a crashed push left is not published"
+    );
+    ok(&d.server, &home, &["fsck", "--strict"]);
+}
