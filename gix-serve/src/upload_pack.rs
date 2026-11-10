@@ -19,7 +19,7 @@ use gix::ObjectId;
 use gix_packetline::Channel;
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What `upload-pack` offers in version 0 and 1. Not `no-done` (a client always says `done` before the pack), not
 /// `thin-pack`, not `shallow`.
@@ -33,11 +33,17 @@ pub(crate) const CAPABILITIES_V2: &[&str] = &["ls-refs=unborn", "fetch"];
 const SMALL_BAND: usize = 995;
 
 /// Answers one stateless-RPC request of `upload-pack` from `repo` in `protocol`: `body` is the request, and the answer is
-/// written to `out`.
-pub fn serve(repo: &gix::Repository, protocol: Protocol, body: &[u8], out: &mut impl Write) -> Result<()> {
+/// written to `out`. Setting `should_interrupt` stops the request where it is, with an error.
+pub fn serve(
+    repo: &gix::Repository,
+    protocol: Protocol,
+    body: &[u8],
+    out: &mut impl Write,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
     match protocol {
-        Protocol::V2 => v2::serve(repo, body, out),
-        Protocol::V0 | Protocol::V1 => v0::serve(repo, body, out),
+        Protocol::V2 => v2::serve(repo, body, out, should_interrupt),
+        Protocol::V0 | Protocol::V1 => v0::serve(repo, body, out, should_interrupt),
     }
 }
 
@@ -111,7 +117,12 @@ mod v0 {
         asked
     }
 
-    pub(super) fn serve(repo: &gix::Repository, body: &[u8], out: &mut impl Write) -> Result<()> {
+    pub(super) fn serve(
+        repo: &gix::Repository,
+        body: &[u8],
+        out: &mut impl Write,
+        should_interrupt: &AtomicBool,
+    ) -> Result<()> {
         let request = parse(body)?;
         check_wants(repo, &request.wants)?;
         let common = in_common(repo, &request.haves);
@@ -128,7 +139,13 @@ mod v0 {
             Some(last) => pkt::data(format!("ACK {last}\n").as_bytes(), out)?,
             None => pkt::data(b"NAK\n", out)?,
         }
-        let pack = pack(repo, &request.wants, &common, request.asked.include_tag)?;
+        let pack = pack(
+            repo,
+            &request.wants,
+            &common,
+            request.asked.include_tag,
+            should_interrupt,
+        )?;
         match request.asked.side_band {
             Some(SideBand::Large) => pkt::band(Channel::Data, &pack, out)?,
             Some(SideBand::Small) => {
@@ -177,11 +194,16 @@ mod v2 {
         Ok(Command { name, arguments })
     }
 
-    pub(super) fn serve(repo: &gix::Repository, body: &[u8], out: &mut impl Write) -> Result<()> {
+    pub(super) fn serve(
+        repo: &gix::Repository,
+        body: &[u8],
+        out: &mut impl Write,
+        should_interrupt: &AtomicBool,
+    ) -> Result<()> {
         let command = parse(body)?;
         match command.name {
             b"ls-refs" => ls_refs(repo, &command.arguments, out),
-            b"fetch" => fetch(repo, &command.arguments, out),
+            b"fetch" => fetch(repo, &command.arguments, out, should_interrupt),
             other => Err(Error::new(format!(
                 "`{}` is not a command this server offers",
                 other.as_bstr()
@@ -237,7 +259,12 @@ mod v2 {
         pkt::flush(out)
     }
 
-    fn fetch(repo: &gix::Repository, arguments: &[&[u8]], out: &mut impl Write) -> Result<()> {
+    fn fetch(
+        repo: &gix::Repository,
+        arguments: &[&[u8]],
+        out: &mut impl Write,
+        should_interrupt: &AtomicBool,
+    ) -> Result<()> {
         let mut wants = Vec::new();
         let mut haves = Vec::new();
         let mut done = false;
@@ -267,25 +294,30 @@ mod v2 {
             for id in &common {
                 pkt::data(format!("ACK {id}\n").as_bytes(), out)?;
             }
-            if !ready(repo, &wants, &common)? {
+            if !ready(repo, &wants, &common, should_interrupt)? {
                 return pkt::flush(out);
             }
             pkt::data(b"ready\n", out)?;
             pkt::delimiter(out)?;
         }
         pkt::data(b"packfile\n", out)?;
-        let pack = pack(repo, &wants, &common, include_tag)?;
+        let pack = pack(repo, &wants, &common, include_tag, should_interrupt)?;
         pkt::band(Channel::Data, &pack, out)?;
         pkt::flush(out)
     }
 
     /// Whether what is in common settles the pack: every path from the wants back through history ends in it, so the
     /// client has every commit the walk does not reach.
-    fn ready(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId]) -> Result<bool> {
+    fn ready(
+        repo: &gix::Repository,
+        wants: &[ObjectId],
+        common: &[ObjectId],
+        should_interrupt: &AtomicBool,
+    ) -> Result<bool> {
         if common.is_empty() {
             return Ok(false);
         }
-        Ok(!walk(repo, wants, common)?.reaches_a_root)
+        Ok(!walk(repo, wants, common, should_interrupt)?.reaches_a_root)
     }
 }
 
@@ -322,7 +354,12 @@ struct Walked {
     reaches_a_root: bool,
 }
 
-fn walk(repo: &gix::Repository, tips: &[ObjectId], hidden: &[ObjectId]) -> Result<Walked> {
+fn walk(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    hidden: &[ObjectId],
+    should_interrupt: &AtomicBool,
+) -> Result<Walked> {
     let commit = |id: &ObjectId| kind_of(repo, *id) == Some(gix::object::Kind::Commit);
     let hidden: Vec<ObjectId> = hidden.iter().copied().filter(commit).collect();
     let mut walked = Walked {
@@ -335,6 +372,9 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId], hidden: &[ObjectId]) -> Resul
         .all()
         .map_err(|e| Error::new(format!("the history cannot be walked: {e}")))?
     {
+        if should_interrupt.load(Ordering::Relaxed) {
+            return Err(Error::new("interrupted"));
+        }
         let info = info.map_err(|e| Error::new(format!("the history cannot be walked: {e}")))?;
         if info.parent_ids.is_empty() {
             walked.reaches_a_root = true;
@@ -346,7 +386,13 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId], hidden: &[ObjectId]) -> Resul
 
 /// The pack of every object reachable from `wants` and not from `common`, and with `include_tag` each annotated tag that
 /// points at a commit in it.
-fn pack(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId], include_tag: bool) -> Result<Vec<u8>> {
+fn pack(
+    repo: &gix::Repository,
+    wants: &[ObjectId],
+    common: &[ObjectId],
+    include_tag: bool,
+    should_interrupt: &AtomicBool,
+) -> Result<Vec<u8>> {
     // A want that is an annotated tag goes in as itself, and the walk starts from what it points to.
     let mut tags = BTreeSet::new();
     let mut tips = Vec::new();
@@ -364,7 +410,7 @@ fn pack(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId], include
             tips.push(*want);
         }
     }
-    let walked = walk(repo, &tips, common)?;
+    let walked = walk(repo, &tips, common, should_interrupt)?;
     let sent: BTreeSet<ObjectId> = walked.commits.iter().copied().collect();
     if include_tag {
         tags.extend(tags_pointing_into(repo, &sent, common)?);
@@ -395,7 +441,6 @@ fn pack(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId], include
         }
     }
 
-    let interrupt = AtomicBool::new(false);
     let progress = gix::progress::Discard;
     // A handle the pack's entries can be made with on other threads.
     let mut db = gix::open(repo.path())
@@ -416,7 +461,7 @@ fn pack(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId], include
         &db,
         &mut input,
         &progress,
-        &interrupt,
+        should_interrupt,
         gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
     )
     .map_err(|e| Error::new(format!("the objects cannot be counted: {e}")))?;
@@ -447,6 +492,9 @@ fn pack(repo: &gix::Repository, wants: &[ObjectId], common: &[ObjectId], include
         repo.object_hash(),
     );
     for written in bytes.by_ref() {
+        if should_interrupt.load(Ordering::Relaxed) {
+            return Err(Error::new("interrupted"));
+        }
         written.map_err(|e| Error::new(format!("the pack cannot be written: {e}")))?;
     }
     drop(bytes);

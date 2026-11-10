@@ -4,6 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 /// Answers the requests on one connection until the client closes it: clients keep a connection alive between requests.
 fn answer(root: &Path, stream: TcpStream) -> std::io::Result<()> {
@@ -116,10 +117,10 @@ fn one(root: &Path, reader: &mut BufReader<TcpStream>, stream: &TcpStream) -> st
     let served = match (method.as_str(), advertisement, service) {
         ("GET", true, service) => gix_serve::advertise(&repo, service, protocol, &mut out),
         ("POST", false, gix_serve::Service::UploadPack) => {
-            gix_serve::upload_pack::serve(&repo, protocol, &body, &mut out)
+            gix_serve::upload_pack::serve(&repo, protocol, &body, &mut out, &AtomicBool::new(false))
         }
         ("POST", false, gix_serve::Service::ReceivePack) => {
-            gix_serve::receive_pack::serve(&repo, &body, &mut out, |_, _| Ok(()))
+            gix_serve::receive_pack::serve(&repo, &body, &mut out, &AtomicBool::new(false), |_, _| Ok(())).map(|_| ())
         }
         _ => {
             respond("405 Method Not Allowed", "text/plain", b"")?;

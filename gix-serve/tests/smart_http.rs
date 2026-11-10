@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 /// Where git runs from, and in which protocol version it asks to be served.
 struct Env {
@@ -179,10 +180,10 @@ fn one(root: &Path, reader: &mut BufReader<TcpStream>, stream: &TcpStream) -> st
     let served = match (method.as_str(), advertisement, service) {
         ("GET", true, service) => gix_serve::advertise(&repo, service, protocol, &mut out),
         ("POST", false, gix_serve::Service::UploadPack) => {
-            gix_serve::upload_pack::serve(&repo, protocol, &body, &mut out)
+            gix_serve::upload_pack::serve(&repo, protocol, &body, &mut out, &AtomicBool::new(false))
         }
         ("POST", false, gix_serve::Service::ReceivePack) => {
-            gix_serve::receive_pack::serve(&repo, &body, &mut out, |_, _| Ok(()))
+            gix_serve::receive_pack::serve(&repo, &body, &mut out, &AtomicBool::new(false), |_, _| Ok(())).map(|_| ())
         }
         _ => {
             respond("405 Method Not Allowed", "text/plain", b"")?;
@@ -296,7 +297,9 @@ fn push_clone_push_again_pull_and_refuse_a_stale_update(version: u8) {
         }
         body.extend(b"0000");
         let mut out = Vec::new();
-        gix_serve::receive_pack::serve(&repo, &body, &mut out, |_, _| Ok(())).unwrap();
+        gix_serve::receive_pack::serve(&repo, &body, &mut out, &AtomicBool::new(false), |_, _| Ok(()))
+            .map(|_| ())
+            .unwrap();
         String::from_utf8_lossy(&out).to_string()
     };
     let null = "0".repeat(40);
@@ -477,7 +480,14 @@ fn ls_refs_lists_what_git_http_backend_lists() {
         );
         let repo = gix::open(root.join(name)).unwrap();
         let mut ours = Vec::new();
-        gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V2, &body, &mut ours).unwrap();
+        gix_serve::upload_pack::serve(
+            &repo,
+            gix_serve::Protocol::V2,
+            &body,
+            &mut ours,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&ours),
             String::from_utf8_lossy(&expected),
@@ -608,7 +618,8 @@ fn a_fetch_is_sent_only_what_the_client_lacks() {
         }
         body.extend(b"0000");
         let mut out = Vec::new();
-        gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V2, &body, &mut out).unwrap();
+        gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V2, &body, &mut out, &AtomicBool::new(false))
+            .unwrap();
         out
     };
     let want = format!("want {second}");
@@ -650,7 +661,7 @@ fn a_fetch_is_sent_only_what_the_client_lacks() {
     body.extend(pkt(&format!("have {first}\n")));
     body.extend(pkt("done\n"));
     let mut out = Vec::new();
-    gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out).unwrap();
+    gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out, &AtomicBool::new(false)).unwrap();
     assert_eq!(packets(&out)[0], Some(format!("ACK {first}\n").into_bytes()));
     assert_eq!(objects_in(&pack_in(&out)), 4);
 }
@@ -712,18 +723,24 @@ fn a_refused_push_leaves_nothing_behind() {
     let second_id = gix::ObjectId::from_hex(second.as_bytes()).unwrap();
     let repo = gix::open(&server).unwrap();
     let mut out = Vec::new();
-    gix_serve::receive_pack::serve(&repo, &body, &mut out, |quarantined, commands| {
-        assert_eq!(commands.len(), 1);
-        let commit = quarantined
-            .find_commit(second_id)
-            .expect("the pushed commit is readable");
-        assert_eq!(commit.message_raw_sloppy(), "second\n");
-        assert!(
-            !gix::open(&server).unwrap().has_object(second_id),
-            "nothing outside sees it"
-        );
-        Err("not this one".into())
-    })
+    gix_serve::receive_pack::serve(
+        &repo,
+        &body,
+        &mut out,
+        &AtomicBool::new(false),
+        |quarantined, commands| {
+            assert_eq!(commands.len(), 1);
+            let commit = quarantined
+                .find_commit(second_id)
+                .expect("the pushed commit is readable");
+            assert_eq!(commit.message_raw_sloppy(), "second\n");
+            assert!(
+                !gix::open(&server).unwrap().has_object(second_id),
+                "nothing outside sees it"
+            );
+            Err("not this one".into())
+        },
+    )
     .unwrap();
     let answer = String::from_utf8_lossy(&out);
     assert!(
@@ -740,7 +757,9 @@ fn a_refused_push_leaves_nothing_behind() {
     assert_eq!(listing(&server.join("objects/pack")), packs_before, "no pack is taken");
 
     let mut out = Vec::new();
-    gix_serve::receive_pack::serve(&repo, &body, &mut out, |_, _| Ok(())).unwrap();
+    gix_serve::receive_pack::serve(&repo, &body, &mut out, &AtomicBool::new(false), |_, _| Ok(()))
+        .map(|_| ())
+        .unwrap();
     let answer = String::from_utf8_lossy(&out);
     assert!(answer.contains("ok refs/heads/main"), "{answer}");
     assert_eq!(ok(&server, &home, &["rev-parse", "main"]), second);
@@ -750,4 +769,203 @@ fn a_refused_push_leaves_nothing_behind() {
         "no quarantine is left"
     );
     ok(&server, &home, &["fsck", "--strict"]);
+}
+
+/// A pack of exactly the objects `ids` names, made by git in `dir`.
+fn pack_of(dir: &Path, home: &Env, args: &[&str], ids: &str) -> Vec<u8> {
+    let mut packer = command(dir, home, &[&["pack-objects", "--stdout", "--quiet"], args].concat());
+    let mut packer = packer
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    packer.stdin.take().unwrap().write_all(ids.as_bytes()).unwrap();
+    let out = packer.wait_with_output().unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+/// What `receive-pack` answers to `commands` and `pack` with every push allowed, and the updates it made.
+fn receive(server: &Path, commands: &[String], pack: &[u8]) -> (String, Vec<gix_serve::receive_pack::Command>) {
+    let repo = gix::open(server).unwrap();
+    let mut body = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        body.extend(pkt(&if i == 0 {
+            format!("{command}\0report-status atomic\n")
+        } else {
+            format!("{command}\n")
+        }));
+    }
+    body.extend(b"0000");
+    body.extend(pack);
+    let mut out = Vec::new();
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    let applied = gix_serve::receive_pack::serve(&repo, &body, &mut out, &interrupt, |_, _| Ok(())).unwrap();
+    (String::from_utf8_lossy(&out).into_owned(), applied)
+}
+
+/// `first`, then `second` on `main` in a work tree and a bare copy served from beside it, and `other`, a commit on `first`
+/// beside `second` that only the work tree has.
+struct Diverged {
+    work: PathBuf,
+    server: PathBuf,
+    first: String,
+    second: String,
+    other: String,
+}
+
+fn diverged(tmp: &Path, home: &Env) -> Diverged {
+    let work = tmp.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    ok(&work, home, &["init", "--quiet"]);
+    write(&work, "README", "hello\n");
+    ok(&work, home, &["add", "--all"]);
+    ok(&work, home, &["commit", "--quiet", "-m", "first"]);
+    let first = ok(&work, home, &["rev-parse", "HEAD"]);
+    write(&work, "README", "hello again\n");
+    ok(&work, home, &["commit", "--quiet", "-am", "second"]);
+    let second = ok(&work, home, &["rev-parse", "HEAD"]);
+    let server = tmp.join("server.git");
+    ok(
+        tmp,
+        home,
+        &["clone", "--quiet", "--bare", work.to_str().unwrap(), "server.git"],
+    );
+    ok(&work, home, &["reset", "--quiet", "--hard", &first]);
+    write(&work, "README", "hello, otherwise\n");
+    ok(&work, home, &["commit", "--quiet", "-am", "other"]);
+    let other = ok(&work, home, &["rev-parse", "HEAD"]);
+    Diverged {
+        work,
+        server,
+        first,
+        second,
+        other,
+    }
+}
+
+/// `receive.denyDeletes` and `receive.denyNonFastForwards` are obeyed as git obeys them: for branches, from the repository's
+/// configuration. A refused push moves nothing; with the settings off, the same push is taken.
+#[test]
+fn a_deletion_or_a_rewrite_is_refused_where_the_repository_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    ok(&d.server, &home, &["config", "receive.denyDeletes", "true"]);
+    ok(&d.server, &home, &["config", "receive.denyNonFastForwards", "true"]);
+    let null = "0".repeat(40);
+    let rewrite = pack_of(
+        &d.work,
+        &home,
+        &["--revs", "--thin"],
+        &format!("{}\n^{}\n", d.other, d.first),
+    );
+
+    let (answer, applied) = receive(&d.server, &[format!("{} {null} refs/heads/main", d.second)], &[]);
+    assert!(answer.contains("ng refs/heads/main deletion prohibited"), "{answer}");
+    assert!(applied.is_empty());
+    let (answer, applied) = receive(
+        &d.server,
+        &[format!("{} {} refs/heads/main", d.second, d.other)],
+        &rewrite,
+    );
+    assert!(answer.contains("ng refs/heads/main non-fast-forward"), "{answer}");
+    assert!(applied.is_empty());
+    assert_eq!(ok(&d.server, &home, &["rev-parse", "main"]), d.second, "nothing moved");
+    assert!(
+        !git(&d.server, &home, &["cat-file", "-e", &d.other]).status.success(),
+        "nothing was taken"
+    );
+    // A tag is not a branch: neither setting holds it.
+    ok(&d.server, &home, &["tag", "t", &d.first]);
+    let (answer, _) = receive(&d.server, &[format!("{} {null} refs/tags/t", d.first)], &[]);
+    assert!(answer.contains("ok refs/tags/t"), "{answer}");
+
+    ok(&d.server, &home, &["config", "receive.denyNonFastForwards", "false"]);
+    let (answer, applied) = receive(
+        &d.server,
+        &[format!("{} {} refs/heads/main", d.second, d.other)],
+        &rewrite,
+    );
+    assert!(answer.contains("ok refs/heads/main"), "{answer}");
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].name, "refs/heads/main");
+    ok(&d.server, &home, &["config", "receive.denyDeletes", "false"]);
+    let (answer, _) = receive(&d.server, &[format!("{} {null} refs/heads/main", d.other)], &[]);
+    assert!(answer.contains("ok refs/heads/main"), "{answer}");
+    ok(&d.server, &home, &["fsck", "--strict"]);
+}
+
+/// A push whose history is not all there, in the pack or in the repository, is refused as git refuses it, and leaves
+/// nothing: here a commit without its tree, and a commit without its parent.
+#[test]
+fn a_push_missing_objects_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    // The server has `first` only, and is offered `other` on top of it.
+    ok(&d.server, &home, &["update-ref", "refs/heads/main", &d.first]);
+    ok(&d.server, &home, &["reflog", "expire", "--expire=now", "--all"]);
+    ok(&d.server, &home, &["gc", "--quiet", "--prune=now"]);
+    let blob = ok(&d.work, &home, &["rev-parse", &format!("{}:README", d.other)]);
+    let packs = |server: &Path| std::fs::read_dir(server.join("objects/pack")).unwrap().count();
+    let before = packs(&d.server);
+    let update = format!("{} {} refs/heads/main", d.first, d.other);
+
+    let without_tree = pack_of(&d.work, &home, &[], &format!("{}\n{blob}\n", d.other));
+    let (answer, applied) = receive(&d.server, std::slice::from_ref(&update), &without_tree);
+    assert!(
+        answer.contains("ng refs/heads/main missing necessary objects"),
+        "{answer}"
+    );
+    assert!(applied.is_empty());
+
+    // `third` on `second`, which the server does not have, sent without it.
+    ok(&d.work, &home, &["reset", "--quiet", "--hard", &d.second]);
+    write(&d.work, "README", "hello a third time\n");
+    ok(&d.work, &home, &["commit", "--quiet", "-am", "third"]);
+    let third = ok(&d.work, &home, &["rev-parse", "HEAD"]);
+    let without_parent = pack_of(&d.work, &home, &["--revs"], &format!("{third}\n^{}\n", d.second));
+    let (answer, applied) = receive(
+        &d.server,
+        &[format!("{} {third} refs/heads/main", d.first)],
+        &without_parent,
+    );
+    assert!(
+        answer.contains("ng refs/heads/main missing necessary objects"),
+        "{answer}"
+    );
+    assert!(applied.is_empty());
+
+    assert_eq!(ok(&d.server, &home, &["rev-parse", "main"]), d.first, "nothing moved");
+    assert_eq!(packs(&d.server), before, "no pack was taken");
+    assert!(
+        !std::fs::read_dir(d.server.join("objects")).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("incoming-")),
+        "no quarantine is left"
+    );
+    // With its whole history the push is taken.
+    let whole = pack_of(&d.work, &home, &["--revs"], &format!("{third}\n^{}\n", d.first));
+    let (answer, applied) = receive(&d.server, &[format!("{} {third} refs/heads/main", d.first)], &whole);
+    assert!(answer.contains("ok refs/heads/main"), "{answer}");
+    assert_eq!(applied.len(), 1);
+    ok(&d.server, &home, &["fsck", "--strict"]);
+}
+
+/// A request whose caller has given up stops: its interrupt flag is set.
+#[test]
+fn an_interrupted_request_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let d = diverged(tmp.path(), &home);
+    let repo = gix::open(&d.server).unwrap();
+    let mut body = pkt(&format!("want {} side-band-64k\n", d.second));
+    body.extend(b"0000");
+    body.extend(pkt("done\n"));
+    let interrupt = std::sync::atomic::AtomicBool::new(true);
+    let mut out = Vec::new();
+    assert!(gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out, &interrupt).is_err());
 }
