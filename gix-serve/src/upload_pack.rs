@@ -11,6 +11,13 @@
 //!
 //! The pack is every object reachable from the wants and not from what is in common: the commits between them, and for each
 //! the objects its tree adds to its parents', with, if asked, each annotated tag that points at a commit sent.
+//!
+//! A shallow fetch (`deepen <n>`; `shallow <id>` for each commit the client's history is cut at already) is answered as git's
+//! own server answers one: the commits within `n` of the wants, counted breadth first, those at the limit that have parents
+//! announced as the client's new cuts (`shallow <id>`), each cut it had that the fetch goes past as gone (`unshallow <id>`):
+//! before the negotiation's answer in version 0, in a `shallow-info` section before the pack in version 2. The client has
+//! what is in common down to its cuts, so the pack is the commits it lacks, each with its whole tree. Flux's
+//! source-controller (go-git) clones at depth one. `deepen-since`, `deepen-not` and `deepen-relative` are not offered.
 
 use crate::pkt::{self, Line};
 use crate::{Error, Protocol, Result};
@@ -22,12 +29,12 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What `upload-pack` offers in version 0 and 1. Not `no-done` (a client always says `done` before the pack), not
-/// `thin-pack`, not `shallow`.
-pub const CAPABILITIES: &str = "multi_ack_detailed side-band-64k side-band ofs-delta no-progress include-tag";
+/// `thin-pack`, not `deepen-since`, `deepen-not` or `deepen-relative`.
+pub const CAPABILITIES: &str = "multi_ack_detailed side-band-64k side-band ofs-delta shallow no-progress include-tag";
 
 /// What it offers in version 2, one capability a line before the agent and the object format: `ls-refs` with unborn heads,
-/// and `fetch` with no shallow, filter or wait-for-done.
-pub(crate) const CAPABILITIES_V2: &[&str] = &["ls-refs=unborn", "fetch"];
+/// and `fetch` with shallow and no filter or wait-for-done.
+pub(crate) const CAPABILITIES_V2: &[&str] = &["ls-refs=unborn", "fetch=shallow"];
 
 /// The most data one packet carries with `side-band` (not `side-band-64k`), less the band byte.
 const SMALL_BAND: usize = 995;
@@ -70,6 +77,9 @@ mod v0 {
         haves: Vec<ObjectId>,
         done: bool,
         asked: Asked,
+        deepen: Deepen,
+        /// Whether anything follows the wants: a round of negotiation, or `done`.
+        negotiates: bool,
     }
 
     fn parse(body: &[u8]) -> Result<Request> {
@@ -77,6 +87,9 @@ mod v0 {
         let mut request = Request::default();
         let mut in_wants = true;
         for line in lines {
+            if !in_wants {
+                request.negotiates = true;
+            }
             match line {
                 Line::Flush => in_wants = false,
                 Line::Delimiter => return Err(Error::new("a delimiter in a version 0 request")),
@@ -92,6 +105,8 @@ mod v0 {
                             request.wants.push(object_id(hex)?);
                         }
                         b"have" if !in_wants => request.haves.push(object_id(rest)?),
+                        b"shallow" if in_wants => request.deepen.client_cuts.push(object_id(rest)?),
+                        b"deepen" if in_wants => request.deepen.depth = Some(depth(rest)?),
                         other => return Err(not_offered(other)),
                     }
                 }
@@ -126,6 +141,19 @@ mod v0 {
         let request = parse(body)?;
         check_wants(repo, &request.wants)?;
         let common = in_common(repo, &request.haves);
+        // Every round of a deepening fetch says first where the client's history is cut, as git's server does.
+        let shallow = request
+            .deepen
+            .shallow(repo, &request.wants, &common, should_interrupt)?;
+        if let Some(shallow) = &shallow {
+            shallow.announce(out)?;
+            pkt::flush(out)?;
+        }
+        // The wants alone, with nothing after them: the first round of a deepening fetch, which asks for the shallow lines
+        // only. git's server answers no more, and its client reads no more.
+        if !request.negotiates {
+            return Ok(());
+        }
         if !request.done {
             if request.asked.multi_ack_detailed {
                 for id in &common {
@@ -144,6 +172,7 @@ mod v0 {
             &request.wants,
             &common,
             request.asked.include_tag,
+            shallow.as_ref(),
             should_interrupt,
         )?;
         match request.asked.side_band {
@@ -269,6 +298,7 @@ mod v2 {
         let mut haves = Vec::new();
         let mut done = false;
         let mut include_tag = false;
+        let mut deepen = Deepen::default();
         for argument in arguments {
             let (verb, rest) = argument.split_once_str(" ").unwrap_or((argument, b""));
             match verb {
@@ -276,6 +306,8 @@ mod v2 {
                 b"have" => haves.push(object_id(rest)?),
                 b"done" => done = true,
                 b"include-tag" => include_tag = true,
+                b"shallow" => deepen.client_cuts.push(object_id(rest)?),
+                b"deepen" => deepen.depth = Some(depth(rest)?),
                 // What the pack is like already: thin packs are not sent, deltas are by offset, and progress is not sent.
                 b"thin-pack" | b"ofs-delta" | b"no-progress" => {}
                 other => return Err(not_offered(other)),
@@ -300,8 +332,14 @@ mod v2 {
             pkt::data(b"ready\n", out)?;
             pkt::delimiter(out)?;
         }
+        let shallow = deepen.shallow(repo, &wants, &common, should_interrupt)?;
+        if let Some(shallow) = &shallow {
+            pkt::data(b"shallow-info\n", out)?;
+            shallow.announce(out)?;
+            pkt::delimiter(out)?;
+        }
         pkt::data(b"packfile\n", out)?;
-        let pack = pack(repo, &wants, &common, include_tag, should_interrupt)?;
+        let pack = pack(repo, &wants, &common, include_tag, shallow.as_ref(), should_interrupt)?;
         pkt::band(Channel::Data, &pack, out)?;
         pkt::flush(out)
     }
@@ -327,6 +365,124 @@ fn object_id(hex: &[u8]) -> Result<ObjectId> {
 
 fn not_offered(what: &[u8]) -> Error {
     Error::new(format!("`{}` is not something this server offered", what.as_bstr()))
+}
+
+fn depth(text: &[u8]) -> Result<u32> {
+    text.to_str()
+        .ok()
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| Error::new(format!("`deepen {}` is not a depth", text.as_bstr())))
+}
+
+/// What a client said of a shallow fetch: how deep, and where its history is cut already.
+#[derive(Debug, Default)]
+struct Deepen {
+    depth: Option<u32>,
+    client_cuts: Vec<ObjectId>,
+}
+
+/// What a deepening fetch is sent: the commits the client lacks within the depth, where its history is cut now that it was
+/// not, and where it was cut and is not any more.
+#[derive(Debug)]
+struct Shallow {
+    commits: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    unshallow: Vec<ObjectId>,
+}
+
+impl Shallow {
+    fn announce(&self, out: &mut impl Write) -> Result<()> {
+        for id in &self.shallow {
+            pkt::data(format!("shallow {id}\n").as_bytes(), out)?;
+        }
+        for id in &self.unshallow {
+            pkt::data(format!("unshallow {id}\n").as_bytes(), out)?;
+        }
+        Ok(())
+    }
+}
+
+impl Deepen {
+    /// What a fetch with this deepening is sent, or none for one that does not deepen.
+    fn shallow(
+        &self,
+        repo: &gix::Repository,
+        wants: &[ObjectId],
+        common: &[ObjectId],
+        should_interrupt: &AtomicBool,
+    ) -> Result<Option<Shallow>> {
+        let Some(depth) = self.depth else {
+            return Ok(None);
+        };
+        let interrupted = || should_interrupt.load(Ordering::Relaxed);
+        let parents = |id: ObjectId| -> Result<Vec<ObjectId>> {
+            Ok(repo
+                .find_commit(id)
+                .map_err(|e| Error::new(format!("the commit {id} cannot be read: {e}")))?
+                .parent_ids()
+                .map(gix::Id::detach)
+                .collect())
+        };
+        let cuts: gix::hashtable::HashSet<ObjectId> = self.client_cuts.iter().copied().collect();
+        // What the client has: what is in common, down to where its history is cut.
+        let mut has = gix::hashtable::HashSet::default();
+        let mut pending: Vec<ObjectId> = common
+            .iter()
+            .copied()
+            .filter(|id| kind_of(repo, *id) == Some(gix::object::Kind::Commit))
+            .collect();
+        while let Some(id) = pending.pop() {
+            if interrupted() {
+                return Err(Error::new("interrupted"));
+            }
+            if !has.insert(id) || cuts.contains(&id) {
+                continue;
+            }
+            pending.extend(parents(id)?);
+        }
+        // What the depth reaches, breadth first, so each commit is counted at its least depth.
+        let (_, tips) = tips_of(repo, wants)?;
+        let mut reached = gix::hashtable::HashMap::<ObjectId, u32>::default();
+        let mut order = Vec::new();
+        let mut boundary = BTreeSet::new();
+        let mut queue: std::collections::VecDeque<(ObjectId, u32)> = tips
+            .into_iter()
+            .filter(|id| kind_of(repo, *id) == Some(gix::object::Kind::Commit))
+            .map(|id| (id, 1))
+            .collect();
+        while let Some((id, at)) = queue.pop_front() {
+            if interrupted() {
+                return Err(Error::new("interrupted"));
+            }
+            if reached.contains_key(&id) {
+                continue;
+            }
+            reached.insert(id, at);
+            order.push(id);
+            let parents = parents(id)?;
+            if at < depth {
+                queue.extend(
+                    parents
+                        .into_iter()
+                        .filter(|p| !reached.contains_key(p))
+                        .map(|p| (p, at + 1)),
+                );
+            } else if !parents.is_empty() {
+                boundary.insert(id);
+            }
+        }
+        Ok(Some(Shallow {
+            commits: order.into_iter().filter(|id| !has.contains(id)).collect(),
+            shallow: boundary.iter().copied().filter(|id| !cuts.contains(id)).collect(),
+            unshallow: self
+                .client_cuts
+                .iter()
+                .copied()
+                .filter(|id| reached.contains_key(id) && !boundary.contains(id))
+                .collect(),
+        }))
+    }
 }
 
 fn check_wants(repo: &gix::Repository, wants: &[ObjectId]) -> Result<()> {
@@ -384,16 +540,9 @@ fn walk(
     Ok(walked)
 }
 
-/// The pack of every object reachable from `wants` and not from `common`, and with `include_tag` each annotated tag that
-/// points at a commit in it.
-fn pack(
-    repo: &gix::Repository,
-    wants: &[ObjectId],
-    common: &[ObjectId],
-    include_tag: bool,
-    should_interrupt: &AtomicBool,
-) -> Result<Vec<u8>> {
-    // A want that is an annotated tag goes in as itself, and the walk starts from what it points to.
+/// The annotated tags among `wants`, and what each want comes to: a tag what it points at, through other tags, and anything
+/// else itself.
+fn tips_of(repo: &gix::Repository, wants: &[ObjectId]) -> Result<(BTreeSet<ObjectId>, Vec<ObjectId>)> {
     let mut tags = BTreeSet::new();
     let mut tips = Vec::new();
     for want in wants {
@@ -410,7 +559,28 @@ fn pack(
             tips.push(*want);
         }
     }
-    let walked = walk(repo, &tips, common, should_interrupt)?;
+    Ok((tags, tips))
+}
+
+/// The pack of every object reachable from `wants` and not from `common`, and with `include_tag` each annotated tag that
+/// points at a commit in it. For a deepening fetch, the commits `shallow` names, each with its whole tree.
+fn pack(
+    repo: &gix::Repository,
+    wants: &[ObjectId],
+    common: &[ObjectId],
+    include_tag: bool,
+    shallow: Option<&Shallow>,
+    should_interrupt: &AtomicBool,
+) -> Result<Vec<u8>> {
+    // A want that is an annotated tag goes in as itself, and the walk starts from what it points to.
+    let (mut tags, tips) = tips_of(repo, wants)?;
+    let walked = match shallow {
+        Some(shallow) => Walked {
+            commits: shallow.commits.clone(),
+            reaches_a_root: false,
+        },
+        None => walk(repo, &tips, common, should_interrupt)?,
+    };
     let sent: BTreeSet<ObjectId> = walked.commits.iter().copied().collect();
     if include_tag {
         tags.extend(tags_pointing_into(repo, &sent, common)?);
@@ -422,9 +592,10 @@ fn pack(
         .filter(|id| kind_of(repo, *id) != Some(gix::object::Kind::Commit))
         .collect();
     // Counting by tree additions puts each commit's parents and their root trees in too. Those not walked are what the
-    // client has (the walk stopped at what is in common), so they are taken out again.
+    // client has (the walk stopped at what is in common), so they are taken out again. A shallow client has no parent of a
+    // commit at its cut to compare with, so each commit goes with its whole tree, and there is nothing to take out.
     let mut already_there = gix::hashtable::HashSet::default();
-    for id in &walked.commits {
+    for id in walked.commits.iter().filter(|_| shallow.is_none()) {
         let commit = repo
             .find_commit(*id)
             .map_err(|e| Error::new(format!("the commit {id} cannot be read: {e}")))?;
@@ -459,7 +630,10 @@ fn pack(
         &mut input,
         &progress,
         should_interrupt,
-        gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
+        match shallow {
+            Some(_) => gix_pack::data::output::count::objects::ObjectExpansion::TreeContents,
+            None => gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
+        },
     )
     .map_err(|e| Error::new(format!("the objects cannot be counted: {e}")))?;
     counts.retain(|count| !already_there.contains(&count.id));

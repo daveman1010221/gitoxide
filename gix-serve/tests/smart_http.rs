@@ -1098,3 +1098,147 @@ fn a_quarantine_left_by_a_crash_is_never_used() {
     );
     ok(&d.server, &home, &["fsck", "--strict"]);
 }
+
+#[test]
+fn a_shallow_clone_fetch_and_unshallow_in_version_0() {
+    shallow_clone_fetch_and_unshallow(0);
+}
+
+#[test]
+fn a_shallow_clone_fetch_and_unshallow_in_version_1() {
+    shallow_clone_fetch_and_unshallow(1);
+}
+
+#[test]
+fn a_shallow_clone_fetch_and_unshallow_in_version_2() {
+    shallow_clone_fetch_and_unshallow(2);
+}
+
+/// A clone of depth one has the head alone, cut there; a fetch of depth one brings the next head alone; and unshallowing
+/// brings the whole history, whole, as git's own server gives them. Flux's source-controller (go-git) clones at depth one.
+fn shallow_clone_fetch_and_unshallow(version: u8) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), version);
+    let served = tmp.path().join("served");
+    std::fs::create_dir_all(&served).unwrap();
+    ok(&served, &home, &["init", "--quiet", "--bare", "repo.git"]);
+    let url = format!("{}/repo.git", serve(served.clone()));
+
+    let author = tmp.path().join("author");
+    std::fs::create_dir_all(&author).unwrap();
+    ok(&author, &home, &["init", "--quiet"]);
+    for (n, text) in ["one", "two", "three"].iter().enumerate() {
+        write(&author, "README", &format!("{text}\n"));
+        write(&author, &format!("src/{n}.rs"), "fn f() {}\n");
+        ok(&author, &home, &["add", "--all"]);
+        ok(&author, &home, &["commit", "--quiet", "-m", text]);
+    }
+    ok(&author, &home, &["push", "--quiet", &url, "main"]);
+    let third = ok(&author, &home, &["rev-parse", "HEAD"]);
+
+    let shallow = tmp.path().join("shallow");
+    ok(
+        tmp.path(),
+        &home,
+        &["clone", "--quiet", "--depth", "1", &url, shallow.to_str().unwrap()],
+    );
+    assert_eq!(ok(&shallow, &home, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        std::fs::read_to_string(shallow.join(".git/shallow")).unwrap().trim(),
+        third,
+        "cut at the head"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shallow.join("src/0.rs")).unwrap(),
+        "fn f() {}\n"
+    );
+    ok(&shallow, &home, &["fsck", "--strict"]);
+
+    write(&author, "README", "four\n");
+    ok(&author, &home, &["commit", "--quiet", "-am", "four"]);
+    ok(&author, &home, &["push", "--quiet", &url, "main"]);
+    let fourth = ok(&author, &home, &["rev-parse", "HEAD"]);
+    ok(&shallow, &home, &["fetch", "--quiet", "--depth", "1", "origin", "main"]);
+    assert_eq!(ok(&shallow, &home, &["rev-parse", "FETCH_HEAD"]), fourth);
+    assert_eq!(ok(&shallow, &home, &["rev-list", "--count", "FETCH_HEAD"]), "1");
+    ok(&shallow, &home, &["fsck", "--strict"]);
+
+    ok(&shallow, &home, &["fetch", "--quiet", "--unshallow", "origin", "main"]);
+    assert_eq!(ok(&shallow, &home, &["rev-list", "--count", "FETCH_HEAD"]), "4");
+    assert!(!shallow.join(".git/shallow").exists(), "no longer shallow");
+    ok(&shallow, &home, &["fsck", "--strict"]);
+}
+
+/// What a fetch of depth one is answered with, by hand in version 0 and 2: the head is announced shallow before the
+/// negotiation (version 0) or in its own section before the pack (version 2), and the pack is the head and its whole tree.
+#[test]
+fn a_fetch_of_depth_one_is_the_head_and_its_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Env::new(tmp.path(), 0);
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    ok(&work, &home, &["init", "--quiet"]);
+    write(&work, "README", "hello\n");
+    write(&work, "src/lib.rs", "pub fn one() -> u8 { 1 }\n");
+    write(&work, "src/main.rs", "fn main() {}\n");
+    write(&work, "docs/notes.md", "# Notes\n");
+    ok(&work, &home, &["add", "--all"]);
+    ok(&work, &home, &["commit", "--quiet", "-m", "first"]);
+    write(
+        &work,
+        "src/lib.rs",
+        "pub fn one() -> u8 { 1 }\npub fn two() -> u8 { 2 }\n",
+    );
+    ok(&work, &home, &["commit", "--quiet", "-am", "second"]);
+    let second = ok(&work, &home, &["rev-parse", "HEAD"]);
+    let repo = gix::open(&work).unwrap();
+    // The commit, three trees and four blobs.
+    let whole = 1 + 3 + 4;
+
+    let mut body = pkt(&format!(
+        "want {second} multi_ack_detailed side-band-64k ofs-delta shallow\n"
+    ));
+    body.extend(pkt("deepen 1\n"));
+    body.extend(b"0000");
+    body.extend(pkt("done\n"));
+    let mut out = Vec::new();
+    gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out, &AtomicBool::new(false)).unwrap();
+    let lines = packets(&out);
+    assert_eq!(lines[0], Some(format!("shallow {second}\n").into_bytes()));
+    assert_eq!(lines[1], None, "the shallow lines end in a flush");
+    assert_eq!(lines[2], Some(b"NAK\n".to_vec()));
+    assert_eq!(objects_in(&pack_in(&out)), whole);
+
+    // The first round of a deepening fetch, the wants alone: the shallow lines, and nothing more, as git's server answers.
+    let mut body = pkt(&format!(
+        "want {second} multi_ack_detailed side-band-64k ofs-delta shallow\n"
+    ));
+    body.extend(pkt("deepen 1\n"));
+    body.extend(b"0000");
+    let mut out = Vec::new();
+    gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V0, &body, &mut out, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        packets(&out),
+        vec![Some(format!("shallow {second}\n").into_bytes()), None,]
+    );
+
+    let mut body = pkt("command=fetch\n");
+    body.extend(b"0001");
+    for argument in [format!("want {second}"), "deepen 1".into(), "done".into()] {
+        body.extend(pkt(&format!("{argument}\n")));
+    }
+    body.extend(b"0000");
+    let mut out = Vec::new();
+    gix_serve::upload_pack::serve(&repo, gix_serve::Protocol::V2, &body, &mut out, &AtomicBool::new(false)).unwrap();
+    let lines = packets(&out);
+    assert_eq!(
+        lines[..4],
+        [
+            Some(b"shallow-info\n".to_vec()),
+            Some(format!("shallow {second}\n").into_bytes()),
+            None,
+            Some(b"packfile\n".to_vec())
+        ]
+    );
+    assert_eq!(objects_in(&pack_in(&out)), whole);
+}
