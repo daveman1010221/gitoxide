@@ -351,6 +351,7 @@ members = [
     "gix-status",
     "gix-revision",
     "gix-packetline",
+    "gix-serve",
     "gix-mailmap",
     "gix-macros",
     "gix-note",
